@@ -70,11 +70,14 @@ export interface AlarmConfig {
 
 export interface ScheduledAlarm {
   config: AlarmConfig;
-  scheduledTime: string;         // "HH:mm" (실제 울릴 시각)
+  scheduledTime: string;         // "HH:mm" (표시용 — 과거/미래 판단에 사용 금지)
+  scheduledAt: string;           // ISO 8601 절대 datetime — 단일 진실소스.
+  //   scheduledAt이 실제 Notification 발화 시각. 과거/미래 비교, 요일 계산, 복원 판단은 모두 scheduledAt 기준.
+  //   scheduledTime은 UI 표시용으로만 사용 (예: "06:20").
   weatherAdjusted: boolean;      // 날씨로 인해 시각 변경됐는지
   precipType: PrecipType | null; // 조정 원인
   notificationId: string;        // expo-notifications 식별자
-  scheduledAt: string;           // 스케줄된 시각 (ISO 8601)
+  schemaVersion: number;         // 1 (AsyncStorage 마이그레이션용. 구조 변경 시 버전 증가)
   forecastSnapshot: WeatherForecast | null; // 스케줄 시점 예보 스냅샷 (TTS 멘트용)
   // 스케줄 당시의 예보를 저장해야 TTS가 "비 때문에 일찍 깨웠는데 맑음" mismatch 방지
 }
@@ -119,6 +122,11 @@ export interface WeatherFetchResult {
   source: 'api' | 'cache' | 'none';
   error?: WeatherError;
 }
+// 유효 조합:
+// { source: 'api',   data: ..., error: undefined }  — API 성공
+// { source: 'cache', data: ..., error: undefined }  — 캐시 HIT
+// { source: 'cache', data: ..., error: WeatherError } — API 실패했지만 만료 캐시 사용 (경고)
+// { source: 'none',  data: null, error: WeatherError } — 완전 실패 (API 실패 + 캐시 없음)
 
 export interface WeatherError {
   code: 'NETWORK' | 'API_ERROR' | 'PARSE_ERROR' | 'LOCATION_ERROR' | 'RATE_LIMIT';
@@ -224,6 +232,24 @@ if (forecast.precipType !== 0) {
 - 타이머 만료 시 단일 API 호출 + 스케줄 저장
 - 디바운싱 중 서브텍스트에 "날씨 확인 중..." 표시
 
+**요일 변경 시 재스케줄 분기**:
+```
+사용자가 daysOfWeek 변경 → 1.5초 디바운스 후 reschedule(config) 호출
+  nextDate = findNextActiveDay(config.daysOfWeek, startFrom = today)
+
+  판단 순서:
+  1. 오늘이 활성 요일 AND 현재 시각 < finalTime → 오늘 날짜로 스케줄 (당일 알람)
+  2. 오늘이 비활성이거나 현재 시각 >= finalTime → tomorrow부터 가장 가까운 활성 요일 탐색
+  3. 활성 요일 없음 → Notification 취소 + idle 상태
+
+  예시 (수요일 18:00에 수요일 토글 OFF):
+    → finalTime = 06:30, 현재 시각 = 18:00 → 오늘 이미 지남
+    → 다음 활성 요일(목요일) 06:30으로 재스케줄
+  예시 (수요일 05:00에 수요일 토글 ON):
+    → finalTime = 06:30, 현재 시각 = 05:00 → 오늘 아직 안 지남
+    → 오늘(수요일) 06:30으로 스케줄
+```
+
 ---
 
 ### `services/weather.ts`
@@ -244,6 +270,11 @@ interface WeatherService {
 }
 ```
 
+**캐시 정리 정책**:
+- 앱 실행 시 `weather_cache_*` 패턴으로 오래된 캐시 조회 후 7일 초과 항목 삭제
+- AsyncStorage.getAllKeys()로 키 목록 조회 → `weather_cache_` prefix 필터링 → 날짜 파싱 → 7일 초과 키 삭제
+- 삭제는 비동기 백그라운드 처리 (앱 시작 UX 블로킹 금지)
+
 **캐시 TTL 정책**:
 - TTL은 고정 24h가 아닌 **알람 시각 기준 상대 계산**
 - 유효 조건: `fetchedAt + TTL > nextAlarmTime + 2h`
@@ -263,6 +294,30 @@ interface WeatherService {
 
 3. 기상청 점검 시간 (04:00-04:10) 감지:
    → 현재 시각이 해당 범위이면 API 건너뜀, 캐시 사용
+```
+
+---
+
+### `lib/kma-address.ts` (수동 주소 picker 데이터셋)
+
+시/군/구 → KMA 격자 좌표 매핑 데이터셋.
+
+```typescript
+// 의존성: 기상청이 제공하는 공식 코드표 (격자 좌표별 행정구역명 목록)
+// 소스: 기상청 기상자료개방포털 → 코드표 다운로드 → 전처리 후 JSON 번들
+//   URL: https://www.data.go.kr/data/15057281/openapi.do (기상청 격자 코드표)
+//   형식: [(시도명, 시군구명, nx, ny)] → src/constants/kma-regions.json 으로 번들
+// 주의: 행정구역 개편 시 업데이트 필요 (연 1회 기상청 코드표 확인 권장)
+
+interface KmaRegion {
+  sido: string;      // "서울특별시"
+  sigungu: string;   // "마포구"
+  nx: number;
+  ny: number;
+}
+
+// 초기 번들: 전국 시/군/구 약 250개 기준
+// GPS 권한 거부 시 picker UI에서 sido 선택 → sigungu 필터 → KmaRegion 반환
 ```
 
 ---
@@ -305,9 +360,14 @@ function nearestSlot(alarmTime: string, slots: string[]): string {
   // 예: "06:35" → "0600" (앞뒤 중 가까운 쪽)
 }
 
+// 강수 판단은 단일 슬롯이 아닌 시간 윈도우 사용:
+// precipWindow(alarmTime): alarmTime - 1h ~ alarmTime + 2h 범위의 모든 fcstTime 슬롯
+// hasRainOrSnow = precipWindow 내 PTY != 0인 슬롯이 하나라도 존재하면 true
+// 이유: nearestSlot만 보면 새벽 3시 비(alarmTime과 무관)가 early alarm을 불필요하게 트리거할 수 있음
+
 응답 items 배열에서:
-- category === 'PTY' && fcstTime === nearestSlot(알람시각, ...) → precipType
-- category === 'SKY' && fcstTime === nearestSlot(...) → sky
+- category === 'PTY' && fcstTime in precipWindow(알람시각) → ANY PTY!=0 이면 precipType 기록
+- category === 'SKY' && fcstTime === nearestSlot(...) → sky (표시용)
 - category === 'TMP' && fcstTime === nearestSlot(...) → currentTemp
 - category === 'TMX' → maxTemp (당일 예보 중 최초 1건)
 - category === 'TMN' → minTemp (당일 예보 중 최초 1건)
@@ -342,6 +402,24 @@ function generateScript(input: TemplateInput): string
 // - maxTemp, minTemp 둘 다 null: 일교차 계산 불가 → 일교차 멘트 생략
 // - 모든 데이터 null: "날씨 정보를 가져오지 못했어요..." fallback 멘트
 // - precipType 0 + 정상 기온: 기본 온도 멘트만
+// - 일교차 보정 조건: (TMX - TMN) >= 10 AND TMX >= 15 → 영하 날씨에서 "낮엔 덥지만" 방지
+```
+
+---
+
+### `lib/storage.ts`
+
+AsyncStorage 타입 안전 래퍼. V1 고정 키 목록:
+
+```typescript
+const STORAGE_KEYS = {
+  ALARM_CONFIG:    'alarm_config',       // AlarmConfig (V1: 1개 고정 키)
+  SCHEDULED_ALARM: 'scheduled_alarm',    // ScheduledAlarm (현재 스케줄)
+  LAST_LOCATION:   'last_location',      // { lat, lon, nx, ny } (GPS 캐시)
+  MANUAL_ADDRESS:  'manual_address',     // { sido, sigungu, nx, ny } (수동 입력)
+  ERROR_LOGS:      'error_logs',         // ErrorLog[] (최대 50건)
+} as const;
+// 참고: AlarmConfig.id(UUID)는 V2 복수 알람 대비 필드이며, V1에서는 저장 키로 사용하지 않음.
 ```
 
 ---
@@ -354,9 +432,15 @@ async function withRetry<T>(
   options: {
     maxAttempts: number;       // 최대 시도 횟수 (기본 3)
     baseDelayMs: number;       // 첫 재시도 대기 (기본 1000ms)
+    timeoutMs?: number;        // 단건 요청 타임아웃 (기본 8000ms). AbortController로 구현.
     shouldRetry?: (error: unknown) => boolean;  // 재시도 조건
   }
 ): Promise<T>
+
+// 타임아웃 동작:
+// - 각 시도마다 독립적인 AbortController 생성 (이전 시도의 abort가 다음 시도에 영향 없도록)
+// - timeoutMs 내 fn() 미완료 시 → AbortError throw → shouldRetry 검사 없이 재시도
+// - 모든 시도 타임아웃 시 → AbortError를 최종 에러로 반환
 
 // 재시도하지 않는 케이스:
 // - HTTP 400, 401, 403 (클라이언트 오류) → 재시도 무의미
@@ -421,6 +505,12 @@ Cold start 라우팅 (앱 killed 상태에서 알림 탭):
   - response?.notification 존재 시 router.replace('/alarm-ring') 즉시 실행
   - 타이밍: useEffect 첫 번째 실행에서 처리 (다른 권한 초기화보다 우선)
   - getLastNotificationResponseAsync는 앱 실행 후 짧은 시간만 유효 → 지연 없이 즉시 호출 필수
+
+Foreground 라우팅 (앱이 열려 있는 상태에서 알람 시각 도래):
+  - _layout.tsx useEffect에서 Notifications.addNotificationReceivedListener() 등록
+  - 콜백: notification.request.content.categoryIdentifier === 'ALARM' 확인 후 router.replace('/alarm-ring')
+  - 주의: foreground에서 수신된 notification은 자동 표시되지 않음 → iOS foreground presentation options 설정 필요 없음 (바로 화면 전환)
+  - 리스너는 _layout.tsx unmount 시 반드시 구독 해제 (메모리 누수 방지)
   ↓
 [services/tts.ts] speak(script)
   → [lib/weather-template.ts] generateScript(forecast) → script
@@ -451,7 +541,8 @@ Cold start 라우팅 (앱 killed 상태에서 알림 탭):
       → 기존 Notification 취소
       → 새 시각 계산
       → 새 Notification 스케줄
-      → AsyncStorage 업데이트
+      → ScheduledAlarm.forecastSnapshot ← 새 WeatherForecast로 업데이트 (TTS용)
+      → AsyncStorage 업데이트 (ScheduledAlarm 전체 — forecastSnapshot 포함)
 ```
 
 ---
@@ -508,14 +599,19 @@ interface PermissionState {
   location: 'granted' | 'denied' | 'undetermined';
 }
 
-// _layout.tsx 마운트 시:
-// 1. 현재 권한 상태 조회
-// 2. notification undetermined → /onboarding/notification 라우팅
-// 3. notification denied → 메인 화면 상단 고정 배너 + 알람 컨트롤 비활성
+// _layout.tsx 마운트 시 실행 순서 (순서 중요):
+// 0. [최우선] getLastNotificationResponseAsync() — cold start 알람 탭 감지 (지연 없이 즉시)
+//    → 응답 있으면 router.replace('/alarm-ring') 즉시. 이후 초기화 불필요.
+// 1. addNotificationReceivedListener() 등록 — foreground 알람 수신 감지
+// 2. Promise.all([checkNotificationPermission(), checkLocationPermission()]) — 병렬 처리
+// 3. notification undetermined → /onboarding/notification 라우팅
+// 4. notification denied → 메인 화면 상단 고정 배너 + 알람 컨트롤 비활성
 //    (앱 포그라운드 복귀 시마다 권한 상태 재확인 → 허용 시 자동 해제)
-// 4. location undetermined → /onboarding/location 라우팅 (온보딩 Step 2에서 처리)
+// 5. location undetermined → /onboarding/location 라우팅 (온보딩 Step 2에서 처리)
 //    주의: 알람 설정 시도 시가 아닌 온보딩 플로우에서 요청 (PRD §3 기준)
-// 5. location denied → 수동 주소 입력 모드 활성 (onboarding/location에서 picker 제공)
+// 6. location denied → 수동 주소 입력 모드 활성 (onboarding/location에서 picker 제공)
+// 7. restoreFromStorage() — 재부팅/업데이트 후 알람 복원
+// 성능 주의: 0번은 절대 다른 작업과 병렬 처리하지 말 것 (응답 유효 시간 짧음)
 ```
 
 ---
@@ -557,19 +653,30 @@ if (!API_KEY) throw new Error('KMA_API_KEY 환경변수 없음');
 | 대상 | 테스트 케이스 |
 |------|-------------|
 | `lib/kma-grid.ts` | 서울 좌표 → (60, 127) 변환, 제주도, 강원도 경계값 |
+| `lib/kma-grid.ts` | 음수/해외 좌표 입력 → 명확한 오류 또는 경계 처리 |
 | `lib/weather-template.ts` | 각 온도 구간별 멘트, null 입력, PTY 조합 |
+| `lib/weather-template.ts` | 일교차 보정: TMX >= 15 AND 차이 >= 10 → 멘트 포함. TMX < 15 → 멘트 생략 |
 | `lib/weather-parser.ts` | 정상 응답 파싱, 필드 누락, 비정상 구조 |
+| `lib/weather-parser.ts` | `nearestSlot()`: "06:35" → "0600", "06:50" → "0700", "00:05" → "0000" 자정 경계 |
 | `lib/retry.ts` | 1회 실패 후 성공, 3회 모두 실패, 400은 재시도 안함 |
+| `lib/retry.ts` | `timeoutMs`: AbortError 발생 → 재시도 카운트 포함. 3회 모두 타임아웃 → AbortError 최종 반환 |
 | `lib/cache.ts` | TTL 이내 HIT, TTL 초과 MISS, 키 불일치 |
+| `lib/cache.ts` | alarm-time-relative TTL: `fetchedAt + TTL > nextAlarmTime + 2h` 경계값 (초과/이내/정확히 경계) |
 | `services/alarm.ts` (알람 시각 계산) | 강수 있음/없음, 자정 역행, 기본값 |
+| `services/alarm.ts` (forecastSnapshot) | `schedule()` 반환 ScheduledAlarm.forecastSnapshot === 입력 forecast |
+| `services/alarm.ts` (restore) | `restoreFromStorage()`: 미래 알람 → 재스케줄, 지난 알람 → 다음 요일 계산 |
+| `services/alarm.ts` (nextAlarm) | `nextAlarm()`: 오늘 이후 첫 활성 요일 계산, 활성 요일 없음 → null 반환 |
 
 ### 통합 테스트
 
 | 시나리오 | 검증 항목 |
 |----------|---------|
 | 알람 설정 → 스케줄 저장 | Notification ID AsyncStorage 저장 확인 |
+| 알람 설정 → forecastSnapshot 저장 | ScheduledAlarm.forecastSnapshot이 null이 아닌지 확인 |
 | API 실패 시 기본 알람 | fallback 로직 동작 확인 |
 | 캐시 HIT | API 미호출 확인 |
+| BackgroundFetch 재스케줄 | 강수 변경 시 forecastSnapshot도 함께 업데이트되는지 확인 |
+| alarm-time-relative TTL 경계 | 알람 시각 30분 전에 fetch → TTL HIT, 알람 시각 + 3h 후 fetch → MISS |
 
 ### 수동 테스트 (실기기 필수)
 
@@ -577,9 +684,17 @@ if (!API_KEY) throw new Error('KMA_API_KEY 환경변수 없음');
 |--------|---------|
 | Local Notification 탭 → alarm-ring 진입 | 실기기에서 직접 확인 |
 | 앱 killed 상태 알람 → cold start | 앱 완전 종료 후 알람 시간 대기 |
+| 앱 foreground 상태에서 알람 시각 도래 → alarm-ring 자동 전환 | 앱 열어둔 채로 알람 시각 대기 |
+| 스누즈 버튼 미표시 확인 | Notification 수신 후 잠금화면에서 스누즈 버튼 없음 확인 |
 | 무음 모드 알람 | 무음 설정 후 알람 발화 확인 |
+| 무음 모드 진동 여부 | 무음 설정 후 알람 발화 → 진동 여부 확인 |
+| Focus/DND 모드에서 notification 도달 여부 | DND 설정 후 notification 수신 확인 |
+| 잠금 화면/killed 상태/Low Power Mode 조합 | 각 조합에서 notification 도달 + 탭 → alarm-ring 확인 |
 | 폰 재부팅 후 알람 복원 | 재부팅 후 앱 실행 → 알람 상태 확인 |
 | BackgroundFetch 동작 | Xcode에서 시뮬레이션 |
+| TTS 60초 후 [건너뛰기] 버튼 노출 | 알람 해제 화면에서 60초 대기 후 버튼 확인 |
+| [CRITICAL POC] expo-speech vs AVSpeechSynthesizer stop() 제어 | expo-speech로 TTS 시작/정지가 가능한지. stop() 없으면 SlideToDisarm 후 TTS 중단 불가 → bare workflow 전환 결정 필요 |
+| 알람음 커스텀 가능 여부 | expo-notifications에서 Clock 앱 알람음 사용 가능한지 확인 |
 
 ---
 
