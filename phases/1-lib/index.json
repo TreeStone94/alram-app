@@ -23,7 +23,8 @@
       "name": "weather-template",
       "status": "completed",
       "started_at": "2026-05-17T03:51:58+0900",
-      "summary": "src/lib/weather-template.ts 구현. generateScript, FRIEND 스타일. 일교차 보정(TMX>=15 AND 차이>=10), PTY 멘트, null 처리 테스트 통과."
+      "summary": "src/lib/weather-template.ts 구현. generateScript, FRIEND 스타일. 일교차 보정(TMX>=15 AND 차이>=10), PTY 멘트, null 처리 테스트 통과.",
+      "completed_at": "2026-05-17T03:54:54+0900"
     },
     {
       "step": 3,
