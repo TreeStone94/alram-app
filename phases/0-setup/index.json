@@ -1,0 +1,32 @@
+{
+  "project": "Cloak Alarm",
+  "phase": "0-setup",
+  "steps": [
+    {
+      "step": 0,
+      "name": "expo-init",
+      "status": "completed",
+      "started_at": "2026-05-15T02:06:00+0900",
+      "completed_at": "2026-05-15T02:16:03+0900",
+      "summary": "Expo managed workflow 초기화, npm install, typecheck 통과. src/app placeholder 생성."
+    },
+    {
+      "step": 1,
+      "name": "type-defs",
+      "status": "completed",
+      "started_at": "2026-05-15T02:16:03+0900",
+      "completed_at": "2026-05-15T02:16:03+0900",
+      "summary": "src/types/ 생성 완료 (alarm.ts, weather.ts, tts.ts). typecheck 통과."
+    },
+    {
+      "step": 2,
+      "name": "constants-storage",
+      "status": "completed",
+      "started_at": "2026-05-15T02:16:03+0900",
+      "completed_at": "2026-05-15T02:16:03+0900",
+      "summary": "src/constants/ 3개, src/lib/storage.ts, src/lib/error-log.ts 생성. STORAGE_KEYS, schemaVersion 마이그레이션 포함. typecheck 통과."
+    }
+  ],
+  "created_at": "2026-05-15T02:06:00+0900",
+  "completed_at": "2026-05-15T02:16:03+0900"
+}

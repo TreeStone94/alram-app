@@ -3,13 +3,14 @@
 Harness Step Executor — phase 내 step을 순차 실행하고 자가 교정한다.
 
 Usage:
-    python3 scripts/execute.py <phase-dir> [--push]
+    python3 scripts/execute.py <phase-dir> [--runner auto|codex|claude] [--push]
 """
 
 import argparse
 import contextlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -17,9 +18,10 @@ import time
 import types
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 ROOT = Path(__file__).resolve().parent.parent
+Runner = Literal["auto", "codex", "claude"]
 
 
 @contextlib.contextmanager
@@ -57,8 +59,10 @@ class StepExecutor:
     FEAT_MSG = "feat({phase}): step {num} — {name}"
     CHORE_MSG = "chore({phase}): step {num} output"
     TZ = timezone(timedelta(hours=9))
+    SUPPORTED_RUNNERS = {"codex", "claude"}
+    RUNNER_ENV = "HARNESS_AGENT_RUNNER"
 
-    def __init__(self, phase_dir_name: str, *, auto_push: bool = False):
+    def __init__(self, phase_dir_name: str, *, auto_push: bool = False, runner: Runner = "auto"):
         self._root = str(ROOT)
         self._phases_dir = ROOT / "phases"
         self._phase_dir = self._phases_dir / phase_dir_name
@@ -79,6 +83,71 @@ class StepExecutor:
         self._project = idx.get("project", "project")
         self._phase_name = idx.get("phase", phase_dir_name)
         self._total = len(idx["steps"])
+        self._runner = self._resolve_runner(runner)
+
+    # --- agent runner ---
+
+    @classmethod
+    def _normalize_runner(cls, runner: str) -> str:
+        return runner.strip().lower()
+
+    @classmethod
+    def _validate_runner(cls, runner: str, source: str) -> str:
+        normalized = cls._normalize_runner(runner)
+        if normalized in cls.SUPPORTED_RUNNERS:
+            return normalized
+        print(
+            f"ERROR: unsupported agent runner from {source}: {runner!r}. "
+            f"Use one of: auto, codex, claude"
+        )
+        sys.exit(1)
+
+    @classmethod
+    def _resolve_runner(cls, runner: Runner) -> str:
+        requested = cls._normalize_runner(runner)
+        if requested != "auto":
+            return cls._validate_runner(requested, "--runner")
+
+        env_runner = os.environ.get(cls.RUNNER_ENV)
+        if env_runner:
+            return cls._validate_runner(env_runner, cls.RUNNER_ENV)
+
+        codex_available = shutil.which("codex") is not None
+        claude_available = shutil.which("claude") is not None
+
+        # Codex sessions export CODEX_* variables. Prefer Codex there even if
+        # Claude Code also happens to be installed on the same machine.
+        if codex_available and any(key.startswith("CODEX_") for key in os.environ):
+            return "codex"
+
+        # Keep legacy behavior for non-Codex terminals where both tools exist.
+        if claude_available:
+            return "claude"
+        if codex_available:
+            return "codex"
+
+        print(
+            "ERROR: no supported agent runner found. Install 'codex' or 'claude', "
+            f"or set {cls.RUNNER_ENV}=codex|claude."
+        )
+        sys.exit(1)
+
+    def _runner_command(self) -> list[str]:
+        if self._runner == "claude":
+            return ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json"]
+        if self._runner == "codex":
+            return [
+                "codex",
+                "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--sandbox",
+                "workspace-write",
+                "-C",
+                self._root,
+                "-",
+            ]
+
+        raise AssertionError(f"unsupported runner: {self._runner}")
 
     def run(self):
         self._print_header()
@@ -185,11 +254,14 @@ class StepExecutor:
         sections = []
         claude_md = ROOT / "CLAUDE.md"
         if claude_md.exists():
-            sections.append(f"## 프로젝트 규칙 (CLAUDE.md)\n\n{claude_md.read_text()}")
+            sections.append(f"## 프로젝트 규칙 (CLAUDE.md)\n\n{claude_md.read_text(encoding='utf-8')}")
+        agents_md = ROOT / "AGENTS.md"
+        if agents_md.exists():
+            sections.append(f"## 프로젝트 규칙 (AGENTS.md)\n\n{agents_md.read_text(encoding='utf-8')}")
         docs_dir = ROOT / "docs"
         if docs_dir.is_dir():
             for doc in sorted(docs_dir.glob("*.md")):
-                sections.append(f"## {doc.stem}\n\n{doc.read_text()}")
+                sections.append(f"## {doc.stem}\n\n{doc.read_text(encoding='utf-8')}")
         return "\n\n---\n\n".join(sections) if sections else ""
 
     @staticmethod
@@ -231,9 +303,15 @@ class StepExecutor:
             f"   {commit_example}\n\n---\n\n"
         )
 
-    # --- Claude 호출 ---
+    # --- agent invocation ---
 
-    def _invoke_claude(self, step: dict, preamble: str) -> dict:
+    @staticmethod
+    def _timeout_text(exc: subprocess.TimeoutExpired) -> tuple[str, str]:
+        stdout = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        return stdout, stderr
+
+    def _invoke_agent(self, step: dict, preamble: str) -> dict:
         step_num, step_name = step["step"], step["name"]
         step_file = self._phase_dir / f"step{step_num}.md"
 
@@ -242,33 +320,64 @@ class StepExecutor:
             sys.exit(1)
 
         prompt = preamble + step_file.read_text()
+        cmd = self._runner_command()
         try:
             result = subprocess.run(
-                ["claude", "-p", "--dangerously-skip-permissions", "--output-format", "json", prompt],
-                cwd=self._root, capture_output=True, text=True, timeout=1800,
+                cmd,
+                cwd=self._root,
+                input=prompt,
+                capture_output=True,
+                text=True,
+                timeout=1800,
             )
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as exc:
+            stdout, stderr = self._timeout_text(exc)
             result = subprocess.CompletedProcess(
-                args=[], returncode=124,
+                args=cmd,
+                returncode=124,
+                stdout=stdout,
+                stderr=(
+                    stderr
+                    or f"TIMEOUT: {self._runner} runner exceeded 1800 seconds. "
+                    f"step {step_num} ({step_name}) timed out."
+                ),
+            )
+        except FileNotFoundError:
+            result = subprocess.CompletedProcess(
+                args=cmd,
+                returncode=127,
                 stdout="",
-                stderr=f"TIMEOUT: Claude가 1800초 초과. step {step_num} ({step_name}) 타임아웃.",
+                stderr=f"ERROR: {self._runner} runner command not found: {cmd[0]}",
             )
 
         if result.returncode != 0:
-            print(f"\n  WARN: Claude가 비정상 종료됨 (code {result.returncode})")
+            print(f"\n  WARN: {self._runner} runner exited with code {result.returncode}")
             if result.stderr:
                 print(f"  stderr: {result.stderr[:500]}")
 
         output = {
-            "step": step_num, "name": step_name,
+            "step": step_num,
+            "name": step_name,
+            "runner": self._runner,
+            "command": cmd,
             "exitCode": result.returncode,
-            "stdout": result.stdout, "stderr": result.stderr,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
         }
         out_path = self._phase_dir / f"step{step_num}-output.json"
-        with open(out_path, "w") as f:
+        with open(out_path, "w", encoding="utf-8") as f:
             json.dump(output, f, indent=2, ensure_ascii=False)
 
         return output
+
+    def _invoke_claude(self, step: dict, preamble: str) -> dict:
+        """Backward-compatible wrapper for older tests/scripts."""
+        previous = self._runner
+        self._runner = "claude"
+        try:
+            return self._invoke_agent(step, preamble)
+        finally:
+            self._runner = previous
 
     # --- 헤더 & 검증 ---
 
@@ -276,6 +385,7 @@ class StepExecutor:
         print(f"\n{'='*60}")
         print(f"  Harness Step Executor")
         print(f"  Phase: {self._phase_name} | Steps: {self._total}")
+        print(f"  Runner: {self._runner}")
         if self._auto_push:
             print(f"  Auto-push: enabled")
         print(f"{'='*60}")
@@ -320,8 +430,8 @@ class StepExecutor:
                 tag += f" [retry {attempt}/{self.MAX_RETRIES}]"
 
             with progress_indicator(tag) as pi:
-                self._invoke_claude(step, preamble)
-                elapsed = int(pi.elapsed)
+                output = self._invoke_agent(step, preamble)
+            elapsed = int(pi.elapsed)
 
             index = self._read_json(self._index_file)
             status = next((s.get("status", "pending") for s in index["steps"] if s["step"] == step_num), "pending")
@@ -347,9 +457,14 @@ class StepExecutor:
                 self._update_top_index("blocked")
                 sys.exit(2)
 
+            default_err = "Step did not update status"
+            if output["exitCode"] != 0:
+                detail = output.get("stderr") or output.get("stdout") or default_err
+                default_err = f"{self._runner} runner failed with exit code {output['exitCode']}: {detail[:1000]}"
+
             err_msg = next(
-                (s.get("error_message", "Step did not update status") for s in index["steps"] if s["step"] == step_num),
-                "Step did not update status",
+                (s.get("error_message", default_err) for s in index["steps"] if s["step"] == step_num),
+                default_err,
             )
 
             if attempt < self.MAX_RETRIES:
@@ -421,10 +536,16 @@ class StepExecutor:
 def main():
     parser = argparse.ArgumentParser(description="Harness Step Executor")
     parser.add_argument("phase_dir", help="Phase directory name (e.g. 0-mvp)")
+    parser.add_argument(
+        "--runner",
+        choices=["auto", "codex", "claude"],
+        default="auto",
+        help="Agent runner to execute each step. Default: auto, or HARNESS_AGENT_RUNNER if set.",
+    )
     parser.add_argument("--push", action="store_true", help="Push branch after completion")
     args = parser.parse_args()
 
-    StepExecutor(args.phase_dir, auto_push=args.push).run()
+    StepExecutor(args.phase_dir, auto_push=args.push, runner=args.runner).run()
 
 
 if __name__ == "__main__":

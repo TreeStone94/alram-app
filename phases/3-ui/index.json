@@ -1,0 +1,12 @@
+{
+  "project": "Cloak Alarm",
+  "phase": "3-ui",
+  "steps": [
+    { "step": 0, "name": "layout-routing", "status": "pending" },
+    { "step": 1, "name": "onboarding", "status": "pending" },
+    { "step": 2, "name": "components", "status": "pending" },
+    { "step": 3, "name": "main-screen", "status": "pending" },
+    { "step": 4, "name": "alarm-ring-screen", "status": "pending" },
+    { "step": 5, "name": "settings-background", "status": "pending" }
+  ]
+}

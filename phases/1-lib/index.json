@@ -1,0 +1,11 @@
+{
+  "project": "Cloak Alarm",
+  "phase": "1-lib",
+  "steps": [
+    { "step": 0, "name": "kma-grid", "status": "pending" },
+    { "step": 1, "name": "weather-parser", "status": "pending" },
+    { "step": 2, "name": "weather-template", "status": "pending" },
+    { "step": 3, "name": "retry-cache", "status": "pending" },
+    { "step": 4, "name": "kma-regions", "status": "pending" }
+  ]
+}
