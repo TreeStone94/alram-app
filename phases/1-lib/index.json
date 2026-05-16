@@ -37,7 +37,10 @@
     {
       "step": 4,
       "name": "kma-regions",
-      "status": "pending"
+      "status": "completed",
+      "started_at": "2026-05-17T03:58:29+0900",
+      "summary": "src/constants/kma-regions.json (54개 지역 임시 데이터), src/lib/kma-address.ts (getSidoList, getSigunguList, findRegion) 구현. 테스트 통과. 공식 데이터셋 교체 시 JSON만 교체하면 됨.",
+      "completed_at": "2026-05-17T04:00:52+0900"
     }
   ],
   "created_at": "2026-05-17T03:45:02+0900"
