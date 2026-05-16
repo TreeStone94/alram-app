@@ -1,8 +1,22 @@
 {
   "phases": [
-    { "dir": "0-setup", "status": "completed", "completed_at": "2026-05-15T02:16:03+0900" },
-    { "dir": "1-lib", "status": "pending" },
-    { "dir": "2-services", "status": "pending" },
-    { "dir": "3-ui", "status": "pending" }
+    {
+      "dir": "0-setup",
+      "status": "completed",
+      "completed_at": "2026-05-15T02:16:03+0900"
+    },
+    {
+      "dir": "1-lib",
+      "status": "completed",
+      "completed_at": "2026-05-17T04:01:28+0900"
+    },
+    {
+      "dir": "2-services",
+      "status": "pending"
+    },
+    {
+      "dir": "3-ui",
+      "status": "pending"
+    }
   ]
 }
