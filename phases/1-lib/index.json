@@ -31,7 +31,8 @@
       "name": "retry-cache",
       "status": "completed",
       "started_at": "2026-05-17T03:54:55+0900",
-      "summary": "src/lib/retry.ts (AbortController 타임아웃, exponential backoff), src/lib/cache.ts (alarm-time-relative TTL) 구현. 모든 테스트 통과."
+      "summary": "src/lib/retry.ts (AbortController 타임아웃, exponential backoff), src/lib/cache.ts (alarm-time-relative TTL) 구현. 모든 테스트 통과.",
+      "completed_at": "2026-05-17T03:58:28+0900"
     },
     {
       "step": 4,
