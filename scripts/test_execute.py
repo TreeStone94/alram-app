@@ -24,12 +24,15 @@ import execute as ex
 
 @pytest.fixture
 def tmp_project(tmp_path):
-    """phases/, CLAUDE.md, docs/ 를 갖춘 임시 프로젝트 구조."""
+    """phases/, AGENTS.md, CLAUDE.md, docs/ 를 갖춘 임시 프로젝트 구조."""
     phases_dir = tmp_path / "phases"
     phases_dir.mkdir()
 
     claude_md = tmp_path / "CLAUDE.md"
     claude_md.write_text("# Rules\n- rule one\n- rule two")
+
+    agents_md = tmp_path / "AGENTS.md"
+    agents_md.write_text("# Agent Rules\n- agent rule")
 
     docs_dir = tmp_path / "docs"
     docs_dir.mkdir()
@@ -78,7 +81,7 @@ def top_index(tmp_project):
 def executor(tmp_project, phase_dir):
     """테스트용 StepExecutor 인스턴스. git 호출은 별도 mock 필요."""
     with patch.object(ex, "ROOT", tmp_project):
-        inst = ex.StepExecutor("0-mvp")
+        inst = ex.StepExecutor("0-mvp", runner="codex")
     # 내부 경로를 tmp_project 기준으로 재설정
     inst._root = str(tmp_project)
     inst._phases_dir = tmp_project / "phases"
@@ -151,6 +154,8 @@ class TestLoadGuardrails:
             result = executor._load_guardrails()
         assert "# Rules" in result
         assert "rule one" in result
+        assert "# Agent Rules" in result
+        assert "agent rule" in result
         assert "# Architecture" in result
         assert "# Guide" in result
 
@@ -171,6 +176,15 @@ class TestLoadGuardrails:
         with patch.object(ex, "ROOT", tmp_project):
             result = executor._load_guardrails()
         assert "CLAUDE.md" not in result
+        assert "Agent Rules" in result
+        assert "Architecture" in result
+
+    def test_no_agents_md(self, executor, tmp_project):
+        (tmp_project / "AGENTS.md").unlink()
+        with patch.object(ex, "ROOT", tmp_project):
+            result = executor._load_guardrails()
+        assert "AGENTS.md" not in result
+        assert "Rules" in result
         assert "Architecture" in result
 
     def test_no_docs_dir(self, executor, tmp_project):
@@ -420,44 +434,133 @@ class TestCommitStep:
 
 
 # ---------------------------------------------------------------------------
-# _invoke_claude (mocked)
+# agent runner selection / invocation (mocked)
 # ---------------------------------------------------------------------------
 
-class TestInvokeClaude:
+class TestAgentRunner:
+    def test_explicit_runner_is_used(self, tmp_project, phase_dir):
+        with patch.object(ex, "ROOT", tmp_project):
+            inst = ex.StepExecutor("0-mvp", runner="codex")
+
+        assert inst._runner == "codex"
+
+    def test_invalid_runner_exits(self, tmp_project, phase_dir):
+        with patch.object(ex, "ROOT", tmp_project):
+            with pytest.raises(SystemExit) as exc_info:
+                ex.StepExecutor("0-mvp", runner="bad")
+
+        assert exc_info.value.code == 1
+
+    def test_env_runner_is_used_for_auto(self, tmp_project, phase_dir):
+        with patch.object(ex, "ROOT", tmp_project):
+            with patch.dict(os.environ, {"HARNESS_AGENT_RUNNER": "claude"}, clear=False):
+                inst = ex.StepExecutor("0-mvp")
+
+        assert inst._runner == "claude"
+
+    def test_invalid_env_runner_exits(self, tmp_project, phase_dir):
+        with patch.object(ex, "ROOT", tmp_project):
+            with patch.dict(os.environ, {"HARNESS_AGENT_RUNNER": "bad"}, clear=False):
+                with pytest.raises(SystemExit) as exc_info:
+                    ex.StepExecutor("0-mvp")
+
+        assert exc_info.value.code == 1
+
+    def test_auto_prefers_codex_inside_codex_environment(self, tmp_project, phase_dir):
+        with patch.object(ex, "ROOT", tmp_project):
+            with patch.dict(os.environ, {"CODEX_SANDBOX": "seatbelt"}, clear=True):
+                with patch("shutil.which", return_value="/bin/tool"):
+                    inst = ex.StepExecutor("0-mvp")
+
+        assert inst._runner == "codex"
+
+    def test_auto_falls_back_to_claude_for_legacy_environment(self, tmp_project, phase_dir):
+        def fake_which(name):
+            return "/bin/claude" if name == "claude" else None
+
+        with patch.object(ex, "ROOT", tmp_project):
+            with patch.dict(os.environ, {}, clear=True):
+                with patch("shutil.which", side_effect=fake_which):
+                    inst = ex.StepExecutor("0-mvp")
+
+        assert inst._runner == "claude"
+
+    def test_auto_uses_codex_when_claude_is_missing(self, tmp_project, phase_dir):
+        def fake_which(name):
+            return "/bin/codex" if name == "codex" else None
+
+        with patch.object(ex, "ROOT", tmp_project):
+            with patch.dict(os.environ, {}, clear=True):
+                with patch("shutil.which", side_effect=fake_which):
+                    inst = ex.StepExecutor("0-mvp")
+
+        assert inst._runner == "codex"
+
+    def test_auto_exits_when_no_supported_runner_exists(self, tmp_project, phase_dir):
+        with patch.object(ex, "ROOT", tmp_project):
+            with patch.dict(os.environ, {}, clear=True):
+                with patch("shutil.which", return_value=None):
+                    with pytest.raises(SystemExit) as exc_info:
+                        ex.StepExecutor("0-mvp")
+
+        assert exc_info.value.code == 1
+
     def test_invokes_claude_with_correct_args(self, executor):
+        executor._runner = "claude"
         mock_result = MagicMock(returncode=0, stdout='{"result": "ok"}', stderr="")
         step = {"step": 2, "name": "ui"}
         preamble = "PREAMBLE\n"
 
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            output = executor._invoke_claude(step, preamble)
+            output = executor._invoke_agent(step, preamble)
 
         cmd = mock_run.call_args[0][0]
         assert cmd[0] == "claude"
         assert "-p" in cmd
         assert "--dangerously-skip-permissions" in cmd
         assert "--output-format" in cmd
-        assert "PREAMBLE" in cmd[-1]
-        assert "UI를 구현하세요" in cmd[-1]
+        assert mock_run.call_args[1]["input"].startswith("PREAMBLE")
+        assert "UI를 구현하세요" in mock_run.call_args[1]["input"]
+        assert output["runner"] == "claude"
+
+    def test_invokes_codex_with_correct_args(self, executor):
+        executor._runner = "codex"
+        mock_result = MagicMock(returncode=0, stdout="done", stderr="")
+        step = {"step": 2, "name": "ui"}
+
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            output = executor._invoke_agent(step, "PREAMBLE\n")
+
+        cmd = mock_run.call_args[0][0]
+        assert cmd[:2] == ["codex", "exec"]
+        assert "--dangerously-bypass-approvals-and-sandbox" in cmd
+        assert "-C" in cmd
+        assert str(executor._root) in cmd
+        assert cmd[-1] == "-"
+        assert mock_run.call_args[1]["input"].startswith("PREAMBLE")
+        assert "UI를 구현하세요" in mock_run.call_args[1]["input"]
+        assert output["runner"] == "codex"
 
     def test_saves_output_json(self, executor):
+        executor._runner = "codex"
         mock_result = MagicMock(returncode=0, stdout='{"ok": true}', stderr="")
         step = {"step": 2, "name": "ui"}
 
         with patch("subprocess.run", return_value=mock_result):
-            executor._invoke_claude(step, "preamble")
+            executor._invoke_agent(step, "preamble")
 
         output_file = executor._phase_dir / "step2-output.json"
         assert output_file.exists()
         data = json.loads(output_file.read_text())
         assert data["step"] == 2
         assert data["name"] == "ui"
+        assert data["runner"] == "codex"
         assert data["exitCode"] == 0
 
     def test_nonexistent_step_file_exits(self, executor):
         step = {"step": 99, "name": "nonexistent"}
         with pytest.raises(SystemExit) as exc_info:
-            executor._invoke_claude(step, "preamble")
+            executor._invoke_agent(step, "preamble")
         assert exc_info.value.code == 1
 
     def test_timeout_is_1800(self, executor):
@@ -465,9 +568,42 @@ class TestInvokeClaude:
         step = {"step": 2, "name": "ui"}
 
         with patch("subprocess.run", return_value=mock_result) as mock_run:
-            executor._invoke_claude(step, "preamble")
+            executor._invoke_agent(step, "preamble")
 
         assert mock_run.call_args[1]["timeout"] == 1800
+
+    def test_timeout_is_captured_in_output_json(self, executor):
+        executor._runner = "codex"
+        step = {"step": 2, "name": "ui"}
+
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired(["codex"], 1800)):
+            output = executor._invoke_agent(step, "preamble")
+
+        assert output["exitCode"] == 124
+        assert "TIMEOUT" in output["stderr"]
+
+    def test_missing_runner_binary_is_captured_in_output_json(self, executor):
+        executor._runner = "codex"
+        step = {"step": 2, "name": "ui"}
+
+        with patch("subprocess.run", side_effect=FileNotFoundError("missing")):
+            output = executor._invoke_agent(step, "preamble")
+
+        assert output["exitCode"] == 127
+        assert "codex" in output["stderr"]
+        assert "not found" in output["stderr"]
+
+    def test_prompt_is_not_passed_as_command_argument(self, executor):
+        executor._runner = "claude"
+        mock_result = MagicMock(returncode=0, stdout="{}", stderr="")
+        prompt_prefix = "PROMPT_SECRET\n"
+
+        with patch("subprocess.run", return_value=mock_result) as mock_run:
+            executor._invoke_agent({"step": 2, "name": "ui"}, prompt_prefix)
+
+        cmd = mock_run.call_args[0][0]
+        assert all("PROMPT_SECRET" not in str(part) for part in cmd)
+        assert mock_run.call_args[1]["input"].startswith(prompt_prefix)
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +622,44 @@ class TestProgressIndicator:
         with ex.progress_indicator("test") as pi:
             time.sleep(0.2)
         assert pi.elapsed > 0
+
+
+# ---------------------------------------------------------------------------
+# _execute_single_step
+# ---------------------------------------------------------------------------
+
+class TestExecuteSingleStep:
+    def test_success_prints_elapsed_after_progress_context_exits(self, executor, monkeypatch, capsys):
+        class FakeProgress:
+            def __init__(self):
+                self.info = type("Info", (), {"elapsed": 0.0})()
+
+            def __enter__(self):
+                return self.info
+
+            def __exit__(self, exc_type, exc, tb):
+                self.info.elapsed = 2.7
+
+        def fake_progress(_label):
+            return FakeProgress()
+
+        def fake_invoke_agent(step, _preamble):
+            index = json.loads(executor._index_file.read_text())
+            for item in index["steps"]:
+                if item["step"] == step["step"]:
+                    item["status"] = "completed"
+                    item["summary"] = "UI 완료"
+            executor._index_file.write_text(json.dumps(index, ensure_ascii=False))
+            return {"exitCode": 0, "stdout": "", "stderr": ""}
+
+        monkeypatch.setattr(ex, "progress_indicator", fake_progress)
+        monkeypatch.setattr(executor, "_invoke_agent", fake_invoke_agent)
+        monkeypatch.setattr(executor, "_commit_step", lambda *_args: None)
+
+        assert executor._execute_single_step({"step": 2, "name": "ui"}, "") is True
+
+        captured = capsys.readouterr()
+        assert "✓ Step 2: ui [2s]" in captured.out
 
 
 # ---------------------------------------------------------------------------
@@ -513,6 +687,23 @@ class TestMainCli:
                 with pytest.raises(SystemExit) as exc_info:
                     ex.main()
                 assert exc_info.value.code == 1
+
+    def test_runner_option_passes_to_executor(self):
+        with patch("sys.argv", ["execute.py", "0-mvp", "--runner", "codex"]):
+            with patch.object(ex, "StepExecutor") as mock_executor:
+                ex.main()
+
+        mock_executor.assert_called_once_with("0-mvp", auto_push=False, runner="codex")
+        mock_executor.return_value.run.assert_called_once()
+
+    def test_invalid_runner_option_exits_before_executor(self):
+        with patch("sys.argv", ["execute.py", "0-mvp", "--runner", "bad"]):
+            with patch.object(ex, "StepExecutor") as mock_executor:
+                with pytest.raises(SystemExit) as exc_info:
+                    ex.main()
+
+        assert exc_info.value.code == 2
+        mock_executor.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

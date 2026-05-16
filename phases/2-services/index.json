@@ -1,0 +1,11 @@
+{
+  "project": "Cloak Alarm",
+  "phase": "2-services",
+  "steps": [
+    { "step": 0, "name": "alarm-service", "status": "pending" },
+    { "step": 1, "name": "weather-service", "status": "pending" },
+    { "step": 2, "name": "tts-service", "status": "pending" },
+    { "step": 3, "name": "location-permissions", "status": "pending" },
+    { "step": 4, "name": "hooks", "status": "pending" }
+  ]
+}
