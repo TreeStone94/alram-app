@@ -15,7 +15,8 @@
       "name": "weather-parser",
       "status": "completed",
       "started_at": "2026-05-17T03:48:43+0900",
-      "summary": "src/lib/weather-parser.ts 구현. nearestSlot, precipWindow, parseKmaResponse. ParseError 포함. 모든 테스트 통과."
+      "summary": "src/lib/weather-parser.ts 구현. nearestSlot, precipWindow, parseKmaResponse. ParseError 포함. 모든 테스트 통과.",
+      "completed_at": "2026-05-17T03:51:57+0900"
     },
     {
       "step": 2,
