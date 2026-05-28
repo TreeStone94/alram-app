@@ -1,0 +1,4 @@
+interface:
+  display_name: "Alram Review"
+  short_description: "Cloak Alarm 변경사항 리뷰"
+  default_prompt: "$alram-review를 사용해서 현재 Cloak Alarm 변경사항을 리뷰해줘."
